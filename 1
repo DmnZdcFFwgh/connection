@@ -1,0 +1,968 @@
+import bs58 from 'bs58';
+import {Buffer} from 'buffer';
+import fetch from 'cross-fetch';
+import type {Response} from 'cross-fetch';
+import {
+  type as pick,
+  number,
+  string,
+  array,
+  boolean,
+  literal,
+  record,
+  union,
+  optional,
+  nullable,
+  coerce,
+  instance,
+  create,
+  tuple,
+  unknown,
+  any,
+} from 'superstruct';
+import type {Struct} from 'superstruct';
+import {Client as RpcWebSocketClient} from 'rpc-websockets';
+import RpcClient from 'jayson/lib/client/browser';
+import {IWSRequestParams} from 'rpc-websockets/dist/lib/client';
+import {AgentManager} from './agent-manager';
+import {EpochSchedule} from './epoch-schedule';
+import {SendTransactionError} from './errors';
+import {NonceAccount} from './nonce-account';
+import {PublicKey} from './publickey';
+import {Signer} from './keypair';
+import {MS_PER_SLOT} from './timing';
+import {Transaction} from './transaction';
+import {Message} from './message';
+import assert from './util/assert';
+import {sleep} from './util/sleep';
+import {promiseTimeout} from './util/promise-timeout';
+import {toBuffer} from './util/to-buffer';
+import {makeWebsocketUrl} from './util/url';
+import type {Blockhash} from './blockhash';
+import type {FeeCalculator} from './fee-calculator';
+import type {TransactionSignature} from './transaction';
+import type {CompiledInstruction} from './message';
+const PublicKeyFromString = coerce(
+  instance(PublicKey),
+  string(),
+  value => new PublicKey(value),
+);
+const RawAccountDataResult = tuple([string(), literal('base64')]);
+const BufferFromRawAccountData = coerce(
+  instance(Buffer),
+  RawAccountDataResult,
+  value => Buffer.from(value[0], 'base64'),
+);
+/**
+ * Attempt to use a recent blockhash for up to 30 seconds
+ * @internal
+ */
+export const BLOCKHASH_CACHE_TIMEOUT_MS = 30 * 1000;
+type RpcRequest = (methodName: string, args: Array<any>) => any;
+type RpcBatchRequest = (requests: RpcParams[]) => any;
+/**
+ * @internal
+ */
+export type RpcParams = {
+  methodName: string;
+  args: Array<any>;
+};
+export type TokenAccountsFilter =
+  | {
+      mint: PublicKey;
+    }
+  | {
+      programId: PublicKey;
+    };
+/**
+ * Extra contextual information for RPC responses
+ */
+export type Context = {
+  slot: number;
+};
+/**
+ * Options for sending transactions
+ */
+export type SendOptions = {
+  /** disable transaction verification step */
+  skipPreflight?: boolean;
+  /** preflight commitment level */
+  preflightCommitment?: Commitment;
+};
+/**
+ * Options for confirming transactions
+ */
+export type ConfirmOptions = {
+  /** disable transaction verification step */
+  skipPreflight?: boolean;
+  /** desired commitment level */
+  commitment?: Commitment;
+  /** preflight commitment level */
+  preflightCommitment?: Commitment;
+};
+/**
+ * Options for getConfirmedSignaturesForAddress2
+ */
+export type ConfirmedSignaturesForAddress2Options = {
+  /**
+   * Start searching backwards from this transaction signature.
+   * @remark If not provided the search starts from the highest max confirmed block.
+   */
+  before?: TransactionSignature;
+  /** Search until this transaction signature is reached, if found before `limit`. */
+  until?: TransactionSignature;
+  /** Maximum transaction signatures to return (between 1 and 1,000, default: 1,000). */
+  limit?: number;
+};
+/**
+ * Options for getSignaturesForAddress
+ */
+export type SignaturesForAddressOptions = {
+  /**
+   * Start searching backwards from this transaction signature.
+   * @remark If not provided the search starts from the highest max confirmed block.
+   */
+  before?: TransactionSignature;
+  /** Search until this transaction signature is reached, if found before `limit`. */
+  until?: TransactionSignature;
+  /** Maximum transaction signatures to return (between 1 and 1,000, default: 1,000). */
+  limit?: number;
+};
+/**
+ * RPC Response with extra contextual information
+ */
+export type RpcResponseAndContext<T> = {
+  /** response context */
+  context: Context;
+  /** response value */
+  value: T;
+};
+/**
+ * @internal
+ */
+function createRpcResult<T, U>(result: Struct<T, U>) {
+  return union([
+    pick({
+      jsonrpc: literal('2.0'),
+      id: string(),
+      result,
+    }),
+    pick({
+      jsonrpc: literal('2.0'),
+      id: string(),
+      error: pick({
+        code: unknown(),
+        message: string(),
+        data: optional(any()),
+      }),
+    }),
+  ]);
+}
+const UnknownRpcResult = createRpcResult(unknown());
+/**
+ * @internal
+ */
+function jsonRpcResult<T, U>(schema: Struct<T, U>) {
+  return coerce(createRpcResult(schema), UnknownRpcResult, value => {
+    if ('error' in value) {
+      return value;
+    } else {
+      return {
+        ...value,
+        result: create(value.result, schema),
+      };
+    }
+  });
+}
+/**
+ * @internal
+ */
+function jsonRpcResultAndContext<T, U>(value: Struct<T, U>) {
+  return jsonRpcResult(
+    pick({
+      context: pick({
+        slot: number(),
+      }),
+      value,
+    }),
+  );
+}
+/**
+ * @internal
+ */
+function notificationResultAndContext<T, U>(value: Struct<T, U>) {
+  return pick({
+    context: pick({
+      slot: number(),
+    }),
+    value,
+  });
+}
+/**
+ * The level of commitment desired when querying state
+ * <pre>
+ *   'processed': Query the most recent block which has reached 1 confirmation by the connected node
+ *   'confirmed': Query the most recent block which has reached 1 confirmation by the cluster
+ *   'finalized': Query the most recent block which has been finalized by the cluster
+ * </pre>
+ */
+export type Commitment =
+  | 'processed'
+  | 'confirmed'
+  | 'finalized'
+  | 'recent' // Deprecated as of v1.5.5
+  | 'single' // Deprecated as of v1.5.5
+  | 'singleGossip' // Deprecated as of v1.5.5
+  | 'root' // Deprecated as of v1.5.5
+  | 'max'; // Deprecated as of v1.5.5
+/**
+ * A subset of Commitment levels, which are at least optimistically confirmed
+ * <pre>
+ *   'confirmed': Query the most recent block which has reached 1 confirmation by the cluster
+ *   'finalized': Query the most recent block which has been finalized by the cluster
+ * </pre>
+ */
+export type Finality = 'confirmed' | 'finalized';
+/**
+ * Filter for largest accounts query
+ * <pre>
+ *   'circulating':    Return the largest accounts that are part of the circulating supply
+ *   'nonCirculating': Return the largest accounts that are not part of the circulating supply
+ * </pre>
+ */
+export type LargestAccountsFilter = 'circulating' | 'nonCirculating';
+/**
+ * Configuration object for changing `getLargestAccounts` query behavior
+ */
+export type GetLargestAccountsConfig = {
+  /** The level of commitment desired */
+  commitment?: Commitment;
+  /** Filter largest accounts by whether they are part of the circulating supply */
+  filter?: LargestAccountsFilter;
+};
+/**
+ * Configuration object for changing query behavior
+ */
+export type SignatureStatusConfig = {
+  /** enable searching status history, not needed for recent transactions */
+  searchTransactionHistory: boolean;
+};
+/**
+ * Information describing a cluster node
+ */
+export type ContactInfo = {
+  /** Identity public key of the node */
+  pubkey: string;
+  /** Gossip network address for the node */
+  gossip: string | null;
+  /** TPU network address for the node (null if not available) */
+  tpu: string | null;
+  /** JSON RPC network address for the node (null if not available) */
+  rpc: string | null;
+  /** Software version of the node (null if not available) */
+  version: string | null;
+};
+/**
+ * Information describing a vote account
+ */
+export type VoteAccountInfo = {
+  /** Public key of the vote account */
+  votePubkey: string;
+  /** Identity public key of the node voting with this account */
+  nodePubkey: string;
+  /** The stake, in lamports, delegated to this vote account and activated */
+  activatedStake: number;
+  /** Whether the vote account is staked for this epoch */
+  epochVoteAccount: boolean;
+  /** Recent epoch voting credit history for this voter */
+  epochCredits: Array<[number, number, number]>;
+  /** A percentage (0-100) of rewards payout owed to the voter */
+  commission: number;
+  /** Most recent slot voted on by this vote account */
+  lastVote: number;
+};
+/**
+ * A collection of cluster vote accounts
+ */
+export type VoteAccountStatus = {
+  /** Active vote accounts */
+  current: Array<VoteAccountInfo>;
+  /** Inactive vote accounts */
+  delinquent: Array<VoteAccountInfo>;
+};
+/**
+ * Network Inflation
+ * (see https://docs.solana.com/implemented-proposals/ed_overview)
+ */
+export type InflationGovernor = {
+  foundation: number;
+  foundationTerm: number;
+  initial: number;
+  taper: number;
+  terminal: number;
+};
+const GetInflationGovernorResult = pick({
+  foundation: number(),
+  foundationTerm: number(),
+  initial: number(),
+  taper: number(),
+  terminal: number(),
+});
+/**
+ * The inflation reward for an epoch
+ */
+export type InflationReward = {
+  /** epoch for which the reward occurs */
+  epoch: number;
+  /** the slot in which the rewards are effective */
+  effectiveSlot: number;
+  /** reward amount in lamports */
+  amount: number;
+  /** post balance of the account in lamports */
+  postBalance: number;
+};
+/**
+ * Expected JSON RPC response for the "getInflationReward" message
+ */
+const GetInflationRewardResult = jsonRpcResult(
+  array(
+    nullable(
+      pick({
+        epoch: number(),
+        effectiveSlot: number(),
+        amount: number(),
+        postBalance: number(),
+      }),
+    ),
+  ),
+);
+/**
+ * Information about the current epoch
+ */
+export type EpochInfo = {
+  epoch: number;
+  slotIndex: number;
+  slotsInEpoch: number;
+  absoluteSlot: number;
+  blockHeight?: number;
+  transactionCount?: number;
+};
+const GetEpochInfoResult = pick({
+  epoch: number(),
+  slotIndex: number(),
+  slotsInEpoch: number(),
+  absoluteSlot: number(),
+  blockHeight: optional(number()),
+  transactionCount: optional(number()),
+});
+const GetEpochScheduleResult = pick({
+  slotsPerEpoch: number(),
+  leaderScheduleSlotOffset: number(),
+  warmup: boolean(),
+  firstNormalEpoch: number(),
+  firstNormalSlot: number(),
+});
+/**
+ * Leader schedule
+ * (see https://docs.solana.com/terminology#leader-schedule)
+ */
+export type LeaderSchedule = {
+  [address: string]: number[];
+};
+const GetLeaderScheduleResult = record(string(), array(number()));
+/**
+ * Transaction error or null
+ */
+const TransactionErrorResult = nullable(union([pick({}), string()]));
+/**
+ * Signature status for a transaction
+ */
+const SignatureStatusResult = pick({
+  err: TransactionErrorResult,
+});
+/**
+ * Transaction signature received notification
+ */
+const SignatureReceivedResult = literal('receivedSignature');
+/**
+ * Version info for a node
+ */
+export type Version = {
+  /** Version of solana-core */
+  'solana-core': string;
+  'feature-set'?: number;
+};
+const VersionResult = pick({
+  'solana-core': string(),
+  'feature-set': optional(number()),
+});
+export type SimulatedTransactionAccountInfo = {
+  /** `true` if this account's data contains a loaded program */
+  executable: boolean;
+  /** Identifier of the program that owns the account */
+  owner: string;
+  /** Number of lamports assigned to the account */
+  lamports: number;
+  /** Optional data assigned to the account */
+  data: string[];
+  /** Optional rent epoch info for account */
+  rentEpoch?: number;
+};
+export type SimulatedTransactionResponse = {
+  err: TransactionError | string | null;
+  logs: Array<string> | null;
+  accounts?: SimulatedTransactionAccountInfo[] | null;
+  unitsConsumed?: number;
+};
+const SimulatedTransactionResponseStruct = jsonRpcResultAndContext(
+  pick({
+    err: nullable(union([pick({}), string()])),
+    logs: nullable(array(string())),
+    accounts: optional(
+      nullable(
+        array(
+          pick({
+            executable: boolean(),
+            owner: string(),
+            lamports: number(),
+            data: array(string()),
+            rentEpoch: optional(number()),
+          }),
+        ),
+      ),
+    ),
+    unitsConsumed: optional(number()),
+  }),
+);
+export type ParsedInnerInstruction = {
+  index: number;
+  instructions: (ParsedInstruction | PartiallyDecodedInstruction)[];
+};
+export type TokenBalance = {
+  accountIndex: number;
+  mint: string;
+  uiTokenAmount: TokenAmount;
+};
+/**
+ * Metadata for a parsed confirmed transaction on the ledger
+ */
+export type ParsedConfirmedTransactionMeta = {
+  /** The fee charged for processing the transaction */
+  fee: number;
+  /** An array of cross program invoked parsed instructions */
+  innerInstructions?: ParsedInnerInstruction[] | null;
+  /** The balances of the transaction accounts before processing */
+  preBalances: Array<number>;
+  /** The balances of the transaction accounts after processing */
+  postBalances: Array<number>;
+  /** An array of program log messages emitted during a transaction */
+  logMessages?: Array<string> | null;
+  /** The token balances of the transaction accounts before processing */
+  preTokenBalances?: Array<TokenBalance> | null;
+  /** The token balances of the transaction accounts after processing */
+  postTokenBalances?: Array<TokenBalance> | null;
+  /** The error result of transaction processing */
+  err: TransactionError | null;
+};
+export type CompiledInnerInstruction = {
+  index: number;
+  instructions: CompiledInstruction[];
+};
+/**
+ * Metadata for a confirmed transaction on the ledger
+ */
+export type ConfirmedTransactionMeta = {
+  /** The fee charged for processing the transaction */
+  fee: number;
+  /** An array of cross program invoked instructions */
+  innerInstructions?: CompiledInnerInstruction[] | null;
+  /** The balances of the transaction accounts before processing */
+  preBalances: Array<number>;
+  /** The balances of the transaction accounts after processing */
+  postBalances: Array<number>;
+  /** An array of program log messages emitted during a transaction */
+  logMessages?: Array<string> | null;
+  /** The token balances of the transaction accounts before processing */
+  preTokenBalances?: Array<TokenBalance> | null;
+  /** The token balances of the transaction accounts after processing */
+  postTokenBalances?: Array<TokenBalance> | null;
+  /** The error result of transaction processing */
+  err: TransactionError | null;
+};
+/**
+ * A processed transaction from the RPC API
+ */
+export type TransactionResponse = {
+  /** The slot during which the transaction was processed */
+  slot: number;
+  /** The transaction */
+  transaction: {
+    /** The transaction message */
+    message: Message;
+    /** The transaction signatures */
+    signatures: string[];
+  };
+  /** Metadata produced from the transaction */
+  meta: ConfirmedTransactionMeta | null;
+  /** The unix timestamp of when the transaction was processed */
+  blockTime?: number | null;
+};
+/**
+ * A confirmed transaction on the ledger
+ */
+export type ConfirmedTransaction = {
+  /** The slot during which the transaction was processed */
+  slot: number;
+  /** The details of the transaction */
+  transaction: Transaction;
+  /** Metadata produced from the transaction */
+  meta: ConfirmedTransactionMeta | null;
+  /** The unix timestamp of when the transaction was processed */
+  blockTime?: number | null;
+};
+/**
+ * A partially decoded transaction instruction
+ */
+export type PartiallyDecodedInstruction = {
+  /** Program id called by this instruction */
+  programId: PublicKey;
+  /** Public keys of accounts passed to this instruction */
+  accounts: Array<PublicKey>;
+  /** Raw base-58 instruction data */
+  data: string;
+};
+/**
+ * A parsed transaction message account
+ */
+export type ParsedMessageAccount = {
+  /** Public key of the account */
+  pubkey: PublicKey;
+  /** Indicates if the account signed the transaction */
+  signer: boolean;
+  /** Indicates if the account is writable for this transaction */
+  writable: boolean;
+};
+/**
+ * A parsed transaction instruction
+ */
+export type ParsedInstruction = {
+  /** Name of the program for this instruction */
+  program: string;
+  /** ID of the program for this instruction */
+  programId: PublicKey;
+  /** Parsed instruction info */
+  parsed: any;
+};
+/**
+ * A parsed transaction message
+ */
+export type ParsedMessage = {
+  /** Accounts used in the instructions */
+  accountKeys: ParsedMessageAccount[];
+  /** The atomically executed instructions for the transaction */
+  instructions: (ParsedInstruction | PartiallyDecodedInstruction)[];
+  /** Recent blockhash */
+  recentBlockhash: string;
+};
+/**
+ * A parsed transaction
+ */
+export type ParsedTransaction = {
+  /** Signatures for the transaction */
+  signatures: Array<string>;
+  /** Message of the transaction */
+  message: ParsedMessage;
+};
+/**
+ * A parsed and confirmed transaction on the ledger
+ */
+export type ParsedConfirmedTransaction = {
+  /** The slot during which the transaction was processed */
+  slot: number;
+  /** The details of the transaction */
+  transaction: ParsedTransaction;
+  /** Metadata produced from the transaction */
+  meta: ParsedConfirmedTransactionMeta | null;
+  /** The unix timestamp of when the transaction was processed */
+  blockTime?: number | null;
+};
+/**
+ * A processed block fetched from the RPC API
+ */
+export type BlockResponse = {
+  /** Blockhash of this block */
+  blockhash: Blockhash;
+  /** Blockhash of this block's parent */
+  previousBlockhash: Blockhash;
+  /** Slot index of this block's parent */
+  parentSlot: number;
+  /** Vector of transactions with status meta and original message */
+  transactions: Array<{
+    /** The transaction */
+    transaction: {
+      /** The transaction message */
+      message: Message;
+      /** The transaction signatures */
+      signatures: string[];
+    };
+    /** Metadata produced from the transaction */
+    meta: ConfirmedTransactionMeta | null;
+  }>;
+  /** Vector of block rewards */
+  rewards?: Array<{
+    /** Public key of reward recipient */
+    pubkey: string;
+    /** Reward value in lamports */
+    lamports: number;
+    /** Account balance after reward is applied */
+    postBalance: number | null;
+    /** Type of reward received */
+    rewardType: string | null;
+  }>;
+  /** The unix timestamp of when the block was processed */
+  blockTime: number | null;
+};
+/**
+ * A ConfirmedBlock on the ledger
+ */
+export type ConfirmedBlock = {
+  /** Blockhash of this block */
+  blockhash: Blockhash;
+  /** Blockhash of this block's parent */
+  previousBlockhash: Blockhash;
+  /** Slot index of this block's parent */
+  parentSlot: number;
+  /** Vector of transactions and status metas */
+  transactions: Array<{
+    transaction: Transaction;
+    meta: ConfirmedTransactionMeta | null;
+  }>;
+  /** Vector of block rewards */
+  rewards?: Array<{
+    pubkey: string;
+    lamports: number;
+    postBalance: number | null;
+    rewardType: string | null;
+  }>;
+  /** The unix timestamp of when the block was processed */
+  blockTime: number | null;
+};
+/**
+ * A ConfirmedBlock on the ledger with signatures only
+ */
+export type ConfirmedBlockSignatures = {
+  /** Blockhash of this block */
+  blockhash: Blockhash;
+  /** Blockhash of this block's parent */
+  previousBlockhash: Blockhash;
+  /** Slot index of this block's parent */
+  parentSlot: number;
+  /** Vector of signatures */
+  signatures: Array<string>;
+  /** The unix timestamp of when the block was processed */
+  blockTime: number | null;
+};
+/**
+ * A performance sample
+ */
+export type PerfSample = {
+  /** Slot number of sample */
+  slot: number;
+  /** Number of transactions in a sample window */
+  numTransactions: number;
+  /** Number of slots in a sample window */
+  numSlots: number;
+  /** Sample window in seconds */
+  samplePeriodSecs: number;
+};
+function createRpcClient(
+  url: string,
+  useHttps: boolean,
+  httpHeaders?: HttpHeaders,
+  fetchMiddleware?: FetchMiddleware,
+  disableRetryOnRateLimit?: boolean,
+): RpcClient {
+  let agentManager: AgentManager | undefined;
+  if (!process.env.BROWSER) {
+    agentManager = new AgentManager(useHttps);
+  }
+  let fetchWithMiddleware: (url: string, options: any) => Promise<Response>;
+  if (fetchMiddleware) {
+    fetchWithMiddleware = (url: string, options: any) => {
+      return new Promise<Response>((resolve, reject) => {
+        fetchMiddleware(url, options, async (url: string, options: any) => {
+          try {
+            resolve(await fetch(url, options));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+    };
+  }
+  const clientBrowser = new RpcClient(async (request, callback) => {
+    const agent = agentManager ? agentManager.requestStart() : undefined;
+    const options = {
+      method: 'POST',
+      body: request,
+      agent,
+      headers: Object.assign(
+        {
+          'Content-Type': 'application/json',
+        },
+        httpHeaders || {},
+      ),
+    };
+    try {
+      let too_many_requests_retries = 5;
+      let res: Response;
+      let waitTime = 500;
+      for (;;) {
+        if (fetchWithMiddleware) {
+          res = await fetchWithMiddleware(url, options);
+        } else {
+          res = await fetch(url, options);
+        }
+        if (res.status !== 429 /* Too many requests */) {
+          break;
+        }
+        if (disableRetryOnRateLimit === true) {
+          break;
+        }
+        too_many_requests_retries -= 1;
+        if (too_many_requests_retries === 0) {
+          break;
+        }
+        console.log(
+          `Server responded with ${res.status} ${res.statusText}.  Retrying after ${waitTime}ms delay...`,
+        );
+        await sleep(waitTime);
+        waitTime *= 2;
+      }
+      const text = await res.text();
+      if (res.ok) {
+        callback(null, text);
+      } else {
+        callback(new Error(`${res.status} ${res.statusText}: ${text}`));
+      }
+    } catch (err) {
+      callback(err);
+      if (err instanceof Error) callback(err);
+    } finally {
+      agentManager && agentManager.requestEnd();
+    }
+  }, {});
+  return clientBrowser;
+}
+function createRpcRequest(client: RpcClient): RpcRequest {
+  return (method, args) => {
+    return new Promise((resolve, reject) => {
+      client.request(method, args, (err: any, response: any) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(response);
+      });
+    });
+  };
+}
+function createRpcBatchRequest(client: RpcClient): RpcBatchRequest {
+  return (requests: RpcParams[]) => {
+    return new Promise((resolve, reject) => {
+      // Do nothing if requests is empty
+      if (requests.length === 0) resolve([]);
+      const batch = requests.map((params: RpcParams) => {
+        return client.request(params.methodName, params.args);
+      });
+      client.request(batch, (err: any, response: any) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(response);
+      });
+    });
+  };
+}
+/**
+ * Expected JSON RPC response for the "getInflationGovernor" message
+ */
+const GetInflationGovernorRpcResult = jsonRpcResult(GetInflationGovernorResult);
+/**
+ * Expected JSON RPC response for the "getEpochInfo" message
+ */
+const GetEpochInfoRpcResult = jsonRpcResult(GetEpochInfoResult);
+/**
+ * Expected JSON RPC response for the "getEpochSchedule" message
+ */
+const GetEpochScheduleRpcResult = jsonRpcResult(GetEpochScheduleResult);
+/**
+ * Expected JSON RPC response for the "getLeaderSchedule" message
+ */
+const GetLeaderScheduleRpcResult = jsonRpcResult(GetLeaderScheduleResult);
+/**
+ * Expected JSON RPC response for the "minimumLedgerSlot" and "getFirstAvailableBlock" messages
+ */
+const SlotRpcResult = jsonRpcResult(number());
+/**
+ * Supply
+ */
+export type Supply = {
+  /** Total supply in lamports */
+  total: number;
+  /** Circulating supply in lamports */
+  circulating: number;
+  /** Non-circulating supply in lamports */
+  nonCirculating: number;
+  /** List of non-circulating account addresses */
+  nonCirculatingAccounts: Array<PublicKey>;
+};
+/**
+ * Expected JSON RPC response for the "getSupply" message
+ */
+const GetSupplyRpcResult = jsonRpcResultAndContext(
+  pick({
+    total: number(),
+    circulating: number(),
+    nonCirculating: number(),
+    nonCirculatingAccounts: array(PublicKeyFromString),
+  }),
+);
+/**
+ * Token amount object which returns a token amount in different formats
+ * for various client use cases.
+ */
+export type TokenAmount = {
+  /** Raw amount of tokens as string ignoring decimals */
+  amount: string;
+  /** Number of decimals configured for token's mint */
+  decimals: number;
+  /** Token amount as float, accounts for decimals */
+  uiAmount: number | null;
+  /** Token amount as string, accounts for decimals */
+  uiAmountString?: string;
+};
+/**
+ * Expected JSON RPC structure for token amounts
+ */
+const TokenAmountResult = pick({
+  amount: string(),
+  uiAmount: nullable(number()),
+  decimals: number(),
+  uiAmountString: optional(string()),
+});
+/**
+ * Token address and balance.
+ */
+export type TokenAccountBalancePair = {
+  /** Address of the token account */
+  address: PublicKey;
+  /** Raw amount of tokens as string ignoring decimals */
+  amount: string;
+  /** Number of decimals configured for token's mint */
+  decimals: number;
+  /** Token amount as float, accounts for decimals */
+  uiAmount: number | null;
+  /** Token amount as string, accounts for decimals */
+  uiAmountString?: string;
+};
+/**
+ * Expected JSON RPC response for the "getTokenLargestAccounts" message
+ */
+const GetTokenLargestAccountsResult = jsonRpcResultAndContext(
+  array(
+    pick({
+      address: PublicKeyFromString,
+      amount: string(),
+      uiAmount: nullable(number()),
+      decimals: number(),
+      uiAmountString: optional(string()),
+    }),
+  ),
+);
+/**
+ * Expected JSON RPC response for the "getTokenAccountsByOwner" message
+ */
+const GetTokenAccountsByOwner = jsonRpcResultAndContext(
+  array(
+    pick({
+      pubkey: PublicKeyFromString,
+      account: pick({
+        executable: boolean(),
+        owner: PublicKeyFromString,
+        lamports: number(),
+        data: BufferFromRawAccountData,
+        rentEpoch: number(),
+      }),
+    }),
+  ),
+);
+const ParsedAccountDataResult = pick({
+  program: string(),
+  parsed: unknown(),
+  space: number(),
+});
+/**
+ * Expected JSON RPC response for the "getTokenAccountsByOwner" message with parsed data
+ */
+const GetParsedTokenAccountsByOwner = jsonRpcResultAndContext(
+  array(
+    pick({
+      pubkey: PublicKeyFromString,
+      account: pick({
+        executable: boolean(),
+        owner: PublicKeyFromString,
+        lamports: number(),
+        data: ParsedAccountDataResult,
+        rentEpoch: number(),
+      }),
+    }),
+  ),
+);
+/**
+ * Pair of an account address and its balance
+ */
+export type AccountBalancePair = {
+  address: PublicKey;
+  lamports: number;
+};
+/**
+ * Expected JSON RPC response for the "getLargestAccounts" message
+ */
+const GetLargestAccountsRpcResult = jsonRpcResultAndContext(
+  array(
+    pick({
+      lamports: number(),
+      address: PublicKeyFromString,
+    }),
+  ),
+);
+/**
+ * @internal
+ */
+const AccountInfoResult = pick({
+  executable: boolean(),
+  owner: PublicKeyFromString,
+  lamports: number(),
+  data: BufferFromRawAccountData,
+  rentEpoch: number(),
+});
+/**
+ * @internal
+ */
+const KeyedAccountInfoResult = pick({
+  pubkey: PublicKeyFromString,
+  account: AccountInfoResult,
+});
+const ParsedOrRawAccountData = coerce(
+  union([instance(Buffer), ParsedAccountDataResult]),
+  union([RawAccountDataResult, ParsedAccountDataResult]),
+  value => {
+    if (Array.isArray(value)) {
+      return create(value, BufferFromRawAccountData);
+    } else {
+      return value;
+    }
+  },
+);
